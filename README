@@ -1,15 +1,19 @@
 This is the README file for Archive::Tar, the Perl module for creation
 and manipulation of tar files.
 
-This is version 0.05. For changes since previous versions, see the POD
+This is version 0.06. For changes since previous versions, see the POD
 documentation in the Tar.pm file.
 
 This module uses no C-coded parts in itself, but it will try to use
 the Compress::Zlib module to read and write gzipped tarfiles.
 Archive::Tar will still work without Zlib, it will just complain a
-little bit (and, of course, not be able to use compression).
+little bit (and, of course, not be able to use compression). The
+complaining will be removed when the module leaves the alpha stage,
+and can be trivially removed by commenting out the offending print
+near the top of Tar.pm.
 
 If you use this module at all, please mail me (calle@lysator.liu.se)
 and tell me what you think of it.
 
-14 July 1997, Calle Dybedahl
+Calle Dybedahl,
+50 Bureaucracy 3163 (mundanely known as 26 September 1997)

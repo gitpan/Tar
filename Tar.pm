@@ -2,32 +2,41 @@ package Archive::Tar;
 
 use strict;
 use Carp;
+use File::Path;
+use File::Basename;
 
 BEGIN {
+    # This bit is straight from the manpages
     use Exporter ();
-    use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $symlinks $compression);
+    use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $symlinks $compression $has_getpwuid $has_getgrgid);
 
-    $VERSION = 0.05;
+    $VERSION = 0.06;
     @ISA = qw(Exporter);
     @EXPORT = qw ();
     %EXPORT_TAGS = ();
     @EXPORT_OK = ();
 
+    # The following bit is not straight from the manpages
+    # Check if symbolic links are available
     $symlinks = 1;
     eval { $_ = readlink $0; };	# Pointless assigment to make -w shut up
     if ($@) {
 	warn "Symbolic links not available.\n";
 	$symlinks = undef;
     }
-
+    # Check if Compress::Zlib is available
     $compression = 1;
     eval {require Compress::Zlib;};
     if ($@) {
 	warn "Compression not available.\n";
 	$compression = undef;
     }
+    # Check for get* (they don't exist on WinNT)
+    eval {$_=getpwuid(0)}; # Pointless assigment to make -w shut up
+    $has_getpwuid = !$@;
+    eval {$_=getgrgid(0)}; # Pointless assigment to make -w shut up
+    $has_getgrgid = !$@;
 }
-
 
 use vars qw(@EXPORT_OK $tar_unpack_header $tar_header_length $error);
 
@@ -62,6 +71,7 @@ sub read_tar {
     }
     else {
 	open(TAR, $filename) or drat;
+	binmode TAR;
 	read(TAR,$head,$tar_header_length);
     }
     while (length($head)==$tar_header_length) {
@@ -91,6 +101,14 @@ sub read_tar {
 	$chksum = oct $chksum;
 	$devmajor = oct $devmajor;
 	$devminor = oct $devminor;
+	
+	return @tarfile if $head eq "\0" x 512;	# End of archive
+	
+	substr($head,148,8) = "        ";
+	if (unpack("%16C*",$head)!=$chksum) {
+	    warn "$name: checksum error.\n";
+	}
+
 	if ($compressed) {
 	    $compressed->gzread($data,$size);
 	}
@@ -174,6 +192,7 @@ sub write_tar {
     }
     else {
 	open(TAR, ">".$filename) or drat;
+	binmode TAR;
 	syswrite(TAR,$tmp,length $tmp);
 	close(TAR) or carp "Failed to close $filename, data may be lost: $!\n";
     }
@@ -205,7 +224,7 @@ sub format_tar_entry {
     $tmp .= "\0" x ($tar_header_length-length($tmp));
     $tmp .= $ref->{data};
     if ($ref->{size}>0) {
-	$tmp .= "\0" x (512 - ($ref->{size}%512));
+	$tmp .= "\0" x (512 - ($ref->{size}%512)) unless $ref->{size}%512==0;
     }
     return $tmp;
 }
@@ -290,7 +309,7 @@ sub add_files {
     my ($mode,$uid,$gid,$rdev,$size,$mtime,$data,$typeflag,$linkname);
     my $counter = 0;
     local ($/);
-
+    
     undef $/;
     foreach $file (@files) {
 	if ((undef,undef,$mode,undef,$uid,$gid,$rdev,$size,
@@ -300,10 +319,11 @@ sub add_files {
 	    if (-f $file) {	# Plain file
 		$typeflag = 0;
 		unless (open(FILE,$file)) {
-		    next; # Can't open file, for some reason. Try next one.
+		    next;	# Can't open file, for some reason. Try next one.
 		}
-	    $data = <FILE>;
-	    close FILE;
+		binmode FILE;
+		$data = <FILE>;
+		close FILE;
 	    }
 	    elsif (-d $file) {	# Directory
 		$typeflag = 5;
@@ -328,28 +348,31 @@ sub add_files {
 		$typeflag = 9;	# Also bogus value.
 	    }
 	    push(@{$self->{'_data'}},{
-			       name => $file,		    
-			       mode => $mode,
-			       uid => $uid,
-			       gid => $gid,
-			       size => length $data,
-			       mtime => $mtime,
-			       chksum => "      ",
-			       typeflag => $typeflag, 
-			       linkname => $linkname,
-			       magic => "ustar\0",
-			       version => "00",
-			       uname => (getpwuid($uid))[0],
-			       gname => (getgrgid($gid))[0],
-			       devmajor => 0, # We don't handle this yet
-			       devminor => 0, # We don't handle this yet
-			       prefix => "", # We don't handle this yet
-			       'data' => $data,
-			      });
-	    	$counter++;	# Successfully added file
+				      name => $file,		    
+				      mode => $mode,
+				      uid => $uid,
+				      gid => $gid,
+				      size => length $data,
+				      mtime => $mtime,
+				      chksum => "      ",
+				      typeflag => $typeflag, 
+				      linkname => $linkname,
+				      magic => "ustar\0",
+				      version => "00",
+				      # WinNT protection
+				      uname => 
+			      $has_getpwuid?(getpwuid($uid))[0]:"unknown",
+				      gname => 
+			      $has_getgrgid?(getgrgid($gid))[0]:"unknown",
+				      devmajor => 0, # We don't handle this yet
+				      devminor => 0, # We don't handle this yet
+				      prefix => "", # We don't handle this yet
+				      'data' => $data,
+				     });
+	    $counter++;		# Successfully added file
 	}
 	else {
-	    next undef;	# stat failed
+	    next;		# stat failed
 	}
     }
     return $counter;
@@ -384,8 +407,9 @@ sub add_data {
     $ref->{linkname}="";
     $ref->{magic}="ustar\0";
     $ref->{version}="00";
-    $ref->{uname}=(getpwuid($>))[0];
-    $ref->{gname}=(getgrgid($ref->{gid}))[0];
+    # WinNT protection
+    $ref->{uname}=$has_getpwuid?(getpwuid($>))[0]:"unknown";
+    $ref->{gname}=$has_getgrgid?(getgrgid($ref->{gid}))[0]:"unknown";
     $ref->{devmajor}=0;
     $ref->{devminor}=0;
     $ref->{prefix}="";
@@ -404,36 +428,28 @@ sub add_data {
 sub extract {
     my $self = shift;
     my (@files) = @_;
-    my ($file, $level, $filename, $dirname);
+    my ($file, $level, $dirname);
 
     foreach $file (@files) {
 	foreach (@{$self->{'_data'}}) {
 	    if ($_->{name} eq $file) {
 		# For the moment, we assume that all paths in tarfiles
 		# are given according to Unix standards.
-		$file =~ m|^(.*?)([^/]*)$|;
-		$dirname = $1;
-		$filename = $2;
-		foreach (split(m|/|,$dirname)) {
-		    if (! -e $_) {
-			mkdir $_,0777 or drat;
-		    }
-		    chdir $_;
-		    $level++;
-		}
-		if ($filename eq '') {
-		    ($filename) = reverse split(m|/|,$1);
-		}
+		# $file =~ m|^(.*?)([^/]*)$|;
+		# $dirname = $1;
+		$dirname = dirname($file);
+		mkpath($dirname) or drat;
 		if ($_->{typeflag}==0) { # Ordinary file
-		    open(FILE,">".$filename);
+		    open(FILE,">".$file);
+		    binmode FILE;
 		    print FILE $_->{'data'};
 		    close FILE;
 		}
 		elsif ($_->{typeflag}==5) { # Directory
-		    if (-e $filename && ! -d $filename) {
+		    if (-e $file && ! -d $file) {
 			drat;
 		    }
-		    mkdir $filename,0777 unless -d $filename;
+		    mkdir $file,0777 unless -d $file;
 		}
 		elsif ($_->{typeflag}==1) {
 		    symlink $file,$_->{linkname} if $symlinks;
@@ -465,6 +481,13 @@ sub extract {
     }
 }
 
+# Return a list of all filenames in in-memory archive.
+sub list_files {
+    my ($self) = shift;
+
+    return map {$_->{name}} @{$self->{'_data'}};
+}
+
 
 ### Standard end of module :-)
 1;
@@ -475,9 +498,9 @@ Tar - module for manipulation of tar archives.
 
 =head1 SYNOPSIS
 
-  use Tar;
+  use Archive::Tar;
 
-  $tar = Tar->new();
+  $tar = Archive::Tar->new();
   $tar->read("origin.tar.gz",1);
   $tar->add_files("file/foo.c", "file/bar.c");
   $tar->add_data("file/baz.c","This is the file contents");
@@ -542,11 +565,26 @@ Write files whose names are equivalent to any of the names in
 C<@filenames> to disk, creating subdirectories as neccesary. This
 might not work too well under VMS and MacOS.
 
+=item C<list_files()>
+
+Returns a list with the names of all files in the in-memory archive.
+
 =back
 
 =head1 CHANGES
 
 =over 4
+
+=item Version 0.06
+
+Added list_files() method, as requested by Michael Wiedman.
+
+Fixed a couple of dysfunctions when run under Windows NT. Michael
+Wiedmann reported the bugs.
+
+Changed the documentation to reflect reality a bit better.
+
+Fixed bug in format_tar_entry. Bug reported by Michael Schilli.
 
 =item Version 0.05
 

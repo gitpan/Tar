@@ -2,7 +2,7 @@ package Archive::Tar;
 
 use strict;
 use Carp;
-use File::Path;
+use Cwd;
 use File::Basename;
 
 BEGIN {
@@ -10,7 +10,7 @@ BEGIN {
     use Exporter ();
     use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $symlinks $compression $has_getpwuid $has_getgrgid);
 
-    $VERSION = 0.06;
+    $VERSION = 0.07;
     @ISA = qw(Exporter);
     @EXPORT = qw ();
     %EXPORT_TAGS = ();
@@ -101,8 +101,13 @@ sub read_tar {
 	$chksum = oct $chksum;
 	$devmajor = oct $devmajor;
 	$devminor = oct $devminor;
+	$name = $prefix."/".$name if $prefix;
+	$prefix = "";
 	
 	return @tarfile if $head eq "\0" x 512;	# End of archive
+	# Apparently this should really be two blocks of 512 zeroes,
+	# but GNU tar sometimes gets it wrong. See comment in the
+	# source code (tar.c) to GNU cpio.
 	
 	substr($head,148,8) = "        ";
 	if (unpack("%16C*",$head)!=$chksum) {
@@ -169,7 +174,7 @@ sub format_tar_file {
     foreach (@tarfile) {
 	$file .= format_tar_entry $_;
     }
-    $file .= "\0" x 512;
+    $file .= "\0" x 1024;
     return $file;
 }
 
@@ -200,10 +205,22 @@ sub write_tar {
 
 sub format_tar_entry {
     my ($ref) = shift;
-    my ($tmp);
-    
+    my ($tmp,$file,$prefix,$pos);
+
+    $file = $ref->{name};
+    if (length($file)>99) {
+	$pos = index $file, "/",(length($file) - 100);
+	next if $pos == -1;	# Filename longer than 100 chars!
+	
+	$prefix = substr $file,0,$pos;
+	$file = substr $file,$pos+1;
+	substr($prefix,0,-155)="" if length($prefix)>154;
+    }
+    else {
+	$prefix="";
+    }
     $tmp = pack("a100a8a8a8a12a12a8a1a100",
-		$ref->{name},
+		$file,
 		sprintf("%6o ",$ref->{mode}),
 		sprintf("%6o ",$ref->{uid}),
 		sprintf("%6o ",$ref->{gid}),
@@ -218,7 +235,7 @@ sub format_tar_entry {
     $tmp .= pack("a32",$ref->{gname});
     $tmp .= pack("a8",sprintf("%6o ",$ref->{devmajor}));
     $tmp .= pack("a8",sprintf("%6o ",$ref->{devminor}));
-    $tmp .= pack("a155",$ref->{prefix});
+    $tmp .= pack("a155",$prefix);
     substr($tmp,148,6) = sprintf("%6o", unpack("%16C*",$tmp));
     substr($tmp,154,1) = "\0";
     $tmp .= "\0" x ($tar_header_length-length($tmp));
@@ -325,12 +342,12 @@ sub add_files {
 		$data = <FILE>;
 		close FILE;
 	    }
-	    elsif (-d $file) {	# Directory
-		$typeflag = 5;
-	    }
 	    elsif (-l $file) {	# Symlink
 		$typeflag = 1;
 		$linkname = readlink $file if $symlinks;
+	    }
+	    elsif (-d $file) {	# Directory
+		$typeflag = 5;
 	    }
 	    elsif (-p $file) {	# Named pipe
 		$typeflag = 6;
@@ -366,7 +383,7 @@ sub add_files {
 			      $has_getgrgid?(getgrgid($gid))[0]:"unknown",
 				      devmajor => 0, # We don't handle this yet
 				      devminor => 0, # We don't handle this yet
-				      prefix => "", # We don't handle this yet
+				      prefix => "",
 				      'data' => $data,
 				     });
 	    $counter++;		# Successfully added file
@@ -389,11 +406,37 @@ sub remove {
     return $self;
 }
 
+# Get the content of a file
+sub get_content {
+    my ($self) = shift;
+    my ($file) = @_;
+    my $entry;
+    
+    ($entry) = grep {$_->{name} eq $file} @{$self->{'_data'}};
+    return $entry->{'data'};
+}
+
+# Replace the content of a file
+sub replace_content {
+    my ($self) = shift;
+    my ($file,$content) = @_;
+    my $entry;
+
+    ($entry) = grep {$_->{name} eq $file} @{$self->{'_data'}};
+    if ($entry) {
+	$entry->{'data'} = $content;
+	return 1;
+    }
+    else {
+	return undef;
+    }
+}
+
 # Add data as a file
 sub add_data {
     my ($self, $file, $data, $opt) = @_;
     my $ref = {};
-    my $key;
+    my ($key);
     
     $ref->{'data'}=$data;
     $ref->{name}=$file;
@@ -428,17 +471,25 @@ sub add_data {
 sub extract {
     my $self = shift;
     my (@files) = @_;
-    my ($file, $level, $dirname);
+    my ($file, $current, @path);
 
     foreach $file (@files) {
 	foreach (@{$self->{'_data'}}) {
 	    if ($_->{name} eq $file) {
 		# For the moment, we assume that all paths in tarfiles
 		# are given according to Unix standards.
-		# $file =~ m|^(.*?)([^/]*)$|;
-		# $dirname = $1;
-		$dirname = dirname($file);
-		mkpath($dirname) or drat;
+		# Which they *are*, according to the tar format spec!
+		(@path) = split(/\//,$file);
+		$file = pop @path;
+		$current = cwd;
+		foreach (@path) {
+		    if (-e $_ && ! -d $_) {
+			warn "$_ exists but is not a directory!\n";
+			next;
+		    }
+		    mkdir $_,0777 unless -d $_;
+		    chdir $_;
+		}
 		if ($_->{typeflag}==0) { # Ordinary file
 		    open(FILE,">".$file);
 		    binmode FILE;
@@ -452,7 +503,7 @@ sub extract {
 		    mkdir $file,0777 unless -d $file;
 		}
 		elsif ($_->{typeflag}==1) {
-		    symlink $file,$_->{linkname} if $symlinks;
+		    symlink $_->{linkname},$file if $symlinks;
 		}
 		elsif ($_->{typeflag}==6) {
 		    warn "Doesn't handle named pipes (yet).\n";
@@ -472,10 +523,10 @@ sub extract {
 		}
 		chmod $_->{mode},$file;
 		utime time, $_->{mtime}, $file;
-		if ($>==0) {	# We are root
+		if ($>==0 && $ ne "MacOS") {	# We are root, and chown exists
 		    chown $_->{uid},$_->{gid},$file;
 		}
-		chdir ".." while $level-->0;
+		chdir $current;
 	    }
 	}
     }
@@ -508,10 +559,7 @@ Tar - module for manipulation of tar archives.
 
 =head1 DESCRIPTION
 
-This module is definitely tentative, and several things will be
-changed rather shortly. The exported routines will not be exported [done],
-all the calls to croak() should be replaced with returning undef() and
-putting error messages in a package global [done].
+This is a module for the handling of tar archives. 
 
 At the moment these methods are implemented:
 
@@ -526,7 +574,9 @@ attempt to read it using L<Compress::Zlib>.
 
 =item C<add_files(@filenamelist)>
 
-Takes a list of filenames and adds them to the in-memory archive.
+Takes a list of filenames and adds them to the in-memory archive. 
+I suspect that this function will produce bogus tar archives when 
+used under MacOS, but I'm not sure and I have no Mac to test it on.
 
 =item C<add_data($filename,$data,$opthashref)>
 
@@ -569,11 +619,41 @@ might not work too well under VMS and MacOS.
 
 Returns a list with the names of all files in the in-memory archive.
 
+=item C<get_content($file)>
+
+Return the content of the named file.
+
+=item C<replace_content($file,$content)>
+
+Make the string $content be the content for the file named $file.
+
 =back
 
 =head1 CHANGES
 
 =over 4
+
+=item Version 0.07
+
+Fixed (hopefully) broken portability to MacOS, reported by Paul J.
+Schinder at Goddard Space Flight Center.
+
+Fixed two bugs with symlink handling, reported in excellent detail by
+an admin at teleport.com called Chris.
+
+Primive tar program (called ptar) included with distribution. Useage
+should be pretty obvious if you've used a normal tar program.
+
+Added methods get_content and replace_content.
+
+Added support for paths longer than 100 characters, according to
+POSIX. This is compatible with just about everything except GNU tar.
+Way to go, GNU tar (use a better tar, or GNU cpio). 
+
+NOTE: When adding files to an archive, files with basenames longer
+      than 100 characters will be silently ignored. If the prefix part
+      of a path is longer than 155 characters, only the last 155
+      characters will be stored.
 
 =item Version 0.06
 

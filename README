@@ -1,8 +1,16 @@
 This is the README file for Archive::Tar, the Perl module for creation
 and manipulation of tar files.
 
-This is version 0.06. For changes since previous versions, see the POD
-documentation in the Tar.pm file.
+This is version 0.07. It fixes a bunch of bugs, implements POSIX-style
+long pathnames and adds a couple of useful methods.
+
+This version also includes a small tar-lookalike program, ptar. There
+is no documentation beyond a usage message, but if you've ever used at
+Unix-style tar program it should be very familiar.
+
+Unless something really strange and terrible shows up, this will be
+the last alpha-test version, and the next release will be beta-test
+and v0.50 or something like that.
 
 This module uses no C-coded parts in itself, but it will try to use
 the Compress::Zlib module to read and write gzipped tarfiles.
@@ -16,4 +24,4 @@ If you use this module at all, please mail me (calle@lysator.liu.se)
 and tell me what you think of it.
 
 Calle Dybedahl,
-50 Bureaucracy 3163 (mundanely known as 26 September 1997)
+33 Aftermath, 3163 (mundanely known as 21 November 1997)

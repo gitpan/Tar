@@ -1,13 +1,13 @@
-package Tar;
+package Archive::Tar;
 
 use strict;
 use Carp;
 
 BEGIN {
     use Exporter ();
-    use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $symlinks);
+    use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $symlinks $compression);
 
-    $VERSION = 0.04;
+    $VERSION = 0.05;
     @ISA = qw(Exporter);
     @EXPORT = qw ();
     %EXPORT_TAGS = ();
@@ -17,101 +17,17 @@ BEGIN {
     eval { $_ = readlink $0; };	# Pointless assigment to make -w shut up
     if ($@) {
 	warn "Symbolic links not available.\n";
-	$symlinks = 0;
+	$symlinks = undef;
+    }
+
+    $compression = 1;
+    eval {require Compress::Zlib;};
+    if ($@) {
+	warn "Compression not available.\n";
+	$compression = undef;
     }
 }
 
-=head1 NAME
-
-Tar - module for manipulation of tar archives.
-
-=head1 SYNOPSIS
-
-  use Tar;
-
-  $tar = Tar->new();
-  $tar->add_files("file/foo.c", "file/bar.c");
-  $tar->add_data("file/bar.c","This is the file contents");
-  $tar->write("files.tar");
-
-=head1 DESCRIPTION
-
-This module is definitely tentative, and several things will be
-changed rather shortly. The exported routines will not be exported [done],
-all the calls to croak() should be replaced with returning undef() and
-putting error messages in a package global [done].
-
-At the moment these methods are implemented:
-
-=over 4
-
-=item C<new()>
-
-Returns a new Tar object. If given a filename as an argument, it will
-try to load that as a tar file.
-
-=item C<add_files(@filenamelist)>
-
-Takes a list of filenames and adds them to the in-memory archive.
-
-=item C<add_data($filename,$data,$opthashref)>
-
-Takes a filename, a scalar full of data and optionally a reference to
-a hash with specific options. Will add a file to the in-memory
-archive, with name C<$filename> and content C<$data>. Specific options
-can be set using C<$opthashref>, which will be documented later.
-
-=item C<remove(@filenamelist)>
-
-Removes any entries with names matching any of the given filenames
-from the in-memory archive. String comparisons are done with C<eq>.
-
-=item C<read('F<file.tar>')>
-
-Try to read the given tarfile into memory. Will I<replace> any previous
-content in C<$tar>!
-
-=item C<write('F<file.tar>')>
-
-Will write the in-memory archive to disk.
-
-=item C<data()>
-
-Returns the in-memory archive. This is a list of references to hashes,
-the internals of which is not currently documented.
-
-=item C<extract(@filenames)>
-
-Write files whose names are equivalent to any of the names in
-C<@filenames> to disk, creating subdirectories as neccesary. This
-might not work too well under VMS and MacOS.
-
-=back
-
-=head1 CHANGES
-
-=over 4
-
-=item Version 0.04
-
-=item Made changes to write_tar so that Solaris' tar likes the resulting 
-      archives better.
-
-=item Protected the calls to readlink() and symlink(). AFAIK this module 
-      should now run just fine on Windows NT.
-
-=item Add method to write a single entry to disk (extract)
-
-=item Added method to add entries entirely from scratch (add_data)
-
-=item Changed name of add() to add_file()
-
-=item All calls to croak() removed and replaced with returning undef
-      and setting Tar::error.
-
-=item Better handling of tarfiles with garbage at the end.
-
-=cut
 
 use vars qw(@EXPORT_OK $tar_unpack_header $tar_header_length $error);
 
@@ -120,6 +36,7 @@ $tar_unpack_header
 $tar_header_length = 512;
 
 sub format_tar_entry;
+sub format_tar_file;
 
 ###
 ### Non-method functions
@@ -128,15 +45,26 @@ sub format_tar_entry;
 sub drat {$error=$!;return undef}
 
 sub read_tar {
-    my ($filename) = @_;
+    my ($filename, $compressed) = @_;
     my @tarfile = ();
     my $i = 0;
     my $head;
     
-    open(TAR, $filename) or drat;
-        
-    while (read(TAR,$head,$tar_header_length)==$tar_header_length) {
-	
+    if ($compressed) {
+	if ($compression) {
+	    $compressed = Compress::Zlib::gzopen($filename,"rb") or drat; # Open compressed
+	    $compressed->gzread($head,$tar_header_length);
+	}
+	else {
+	    $error = "Compression not available (install Compress::Zlib).\n";
+	    return undef;
+	}
+    }
+    else {
+	open(TAR, $filename) or drat;
+	read(TAR,$head,$tar_header_length);
+    }
+    while (length($head)==$tar_header_length) {
 	my ($name,		# string
 	    $mode,		# octal number
 	    $uid,		# octal number
@@ -163,15 +91,26 @@ sub read_tar {
 	$chksum = oct $chksum;
 	$devmajor = oct $devmajor;
 	$devminor = oct $devminor;
-	if (read(TAR,$data,$size)!=$size) {
-	    croak "Read error on tarfile.\n";
+	if ($compressed) {
+	    $compressed->gzread($data,$size);
+	}
+	else {
+	    if (read(TAR,$data,$size)!=$size) {
+		$error = "Read error on tarfile.";
+		return undef;
+	    }
 	}
 	$diff = $size%512;
 	
 	if ($diff!=0) {
-	    read(TAR,$dummy,512-$diff); # Padding, throw away
+	    if ($compressed) {
+		$compressed->gzread($dummy,512-$diff);
+	    }
+	    else {
+		read(TAR,$dummy,512-$diff); # Padding, throw away
+	    }
 	}
-
+	
 	# Guard against tarfiles with garbage at the end
 	return @tarfile if $name eq ''; 
 	
@@ -194,24 +133,50 @@ sub read_tar {
 			prefix => $prefix,
 			data => $data};
     }
-
+    continue {
+	if ($compressed) {
+	    $compressed->gzread($head,$tar_header_length);
+	}
+	else {
+	    read(TAR,$head,$tar_header_length);
+	}
+    }
     return @tarfile;
+}
+
+sub format_tar_file {
+    my @tarfile = @_;
+    my $file = "";
+    
+    foreach (@tarfile) {
+	$file .= format_tar_entry $_;
+    }
+    $file .= "\0" x 512;
+    return $file;
 }
 
 sub write_tar {
     my ($filename) = shift;
+    my ($compressed) = shift;
     my @tarfile = @_;
     my ($tmp);
 
-     open(TAR, ">".$filename) or drat;
     
-    foreach (@tarfile) {
-	$tmp = format_tar_entry $_;
-	syswrite(TAR,$tmp,length($tmp));
+    $tmp = format_tar_file @tarfile;
+    if ($compressed) {
+	if (!$compression) {
+	    $error = "Compression not available.\n";
+	    return undef;
+	}
+	$compressed = Compress::Zlib::gzopen($filename,"wb") or drat;
+	$compressed->gzwrite($tmp);
+	$compressed->gzclose;
     }
-    $tmp = "\0" x 512;
-    syswrite(TAR,$tmp,512);
-    close(TAR) or carp "Failed to close $filename, data may be lost: $!\n";
+    else {
+	open(TAR, ">".$filename) or drat;
+	syswrite(TAR,$tmp,length $tmp);
+	close(TAR) or carp "Failed to close $filename, data may be lost: $!\n";
+    }
 }
 
 sub format_tar_entry {
@@ -254,21 +219,22 @@ sub format_tar_entry {
 # readable file.
 sub new {
     my $class = shift;
+    my ($filename,$compressed) = @_;
     my $self = {};
 
     bless $self, $class;
 
-    $self->{_filename} = undef;
-    if (!defined $_[0]) {
+    $self->{'_filename'} = undef;
+    if (!defined $filename) {
 	return $self;
     }
-    if (-r $_[0]) {
-	$self->{_data} = [read_tar $_[0]];
-	$self->{_filename} = $_[0];
+    if (-r $filename) {
+	$self->{'_data'} = [read_tar $filename,$compressed];
+	$self->{'_filename'} = $filename;
 	return $self;
     }
-    if (-e $_[0]) {
-	carp "File exists but is not readable: $_[0]\n";
+    if (-e $filename) {
+	carp "File exists but is not readable: $filename\n";
     }
     return $self;
 }
@@ -278,29 +244,29 @@ sub new {
 sub data {
     my $self = shift;
 
-    return @{$self->{_data}};
+    return @{$self->{'_data'}};
 }
 
 # Read a tarfile. Returns number of component files.
 sub read {
     my $self = shift;
-    my $file = $_[0];
+    my ($file, $compressed) = @_;
 
-    $self->{_filename} = undef;
+    $self->{'_filename'} = undef;
     if (! -e $file) {
 	carp "$file does not exist.\n";
-	$self->{_data}=[];
+	$self->{'_data'}=[];
 	return undef;
     }
     elsif (! -r $file) {
 	carp "$file is not readable.\n";
-	$self->{_data}=[];
+	$self->{'_data'}=[];
 	return undef;
     }
     else {
-	$self->{_data}=[read_tar $file];
-	$self->{_filename} = $file;
-	return scalar @{$self->{_data}};
+	$self->{'_data'}=[read_tar $file, $compressed];
+	$self->{'_filename'} = $file;
+	return scalar @{$self->{'_data'}};
     }
 }
 
@@ -308,11 +274,12 @@ sub read {
 sub write {
     my ($self) = shift @_;
     my ($file) = shift @_;
-
+    my ($compressed) = shift @_;
+    
     unless ($file) {
-	$file = $self->{_filename};
+	return format_tar_file @{$self->{'_data'}};
     }
-    write_tar $file, @{$self->{_data}};
+    write_tar $file, $compressed, @{$self->{'_data'}};
 }
 
 # Add files to the archive. Returns number of successfully added files.
@@ -360,7 +327,7 @@ sub add_files {
 	    else {		# Something else (like what?)
 		$typeflag = 9;	# Also bogus value.
 	    }
-	    push(@{$self->{_data}},{
+	    push(@{$self->{'_data'}},{
 			       name => $file,		    
 			       mode => $mode,
 			       uid => $uid,
@@ -394,7 +361,7 @@ sub remove {
     my $file;
     
     foreach $file (@files) {
-	@{$self->{_data}} = grep {$_->{name} ne $file} @{$self->{_data}};
+	@{$self->{'_data'}} = grep {$_->{name} ne $file} @{$self->{'_data'}};
     }
     return $self;
 }
@@ -418,7 +385,7 @@ sub add_data {
     $ref->{magic}="ustar\0";
     $ref->{version}="00";
     $ref->{uname}=(getpwuid($>))[0];
-    $ref->{gname}=(getgrgid($)))[0];
+    $ref->{gname}=(getgrgid($ref->{gid}))[0];
     $ref->{devmajor}=0;
     $ref->{devminor}=0;
     $ref->{prefix}="";
@@ -429,7 +396,7 @@ sub add_data {
 	}
     }
 
-    push(@{$self->{_data}},$ref);
+    push(@{$self->{'_data'}},$ref);
     return 1;
 }
 
@@ -440,7 +407,7 @@ sub extract {
     my ($file, $level, $filename, $dirname);
 
     foreach $file (@files) {
-	foreach (@{$self->{_data}}) {
+	foreach (@{$self->{'_data'}}) {
 	    if ($_->{name} eq $file) {
 		# For the moment, we assume that all paths in tarfiles
 		# are given according to Unix standards.
@@ -501,3 +468,112 @@ sub extract {
 
 ### Standard end of module :-)
 1;
+
+=head1 NAME
+
+Tar - module for manipulation of tar archives.
+
+=head1 SYNOPSIS
+
+  use Tar;
+
+  $tar = Tar->new();
+  $tar->read("origin.tar.gz",1);
+  $tar->add_files("file/foo.c", "file/bar.c");
+  $tar->add_data("file/baz.c","This is the file contents");
+  $tar->write("files.tar");
+
+=head1 DESCRIPTION
+
+This module is definitely tentative, and several things will be
+changed rather shortly. The exported routines will not be exported [done],
+all the calls to croak() should be replaced with returning undef() and
+putting error messages in a package global [done].
+
+At the moment these methods are implemented:
+
+=over 4
+
+=item C<new()>
+
+Returns a new Tar object. If given a filename as an argument, it will
+try to load that as a tar file. If given a true value as a second
+argument, will assume that the tar file is compressed, and will
+attempt to read it using L<Compress::Zlib>.
+
+=item C<add_files(@filenamelist)>
+
+Takes a list of filenames and adds them to the in-memory archive.
+
+=item C<add_data($filename,$data,$opthashref)>
+
+Takes a filename, a scalar full of data and optionally a reference to
+a hash with specific options. Will add a file to the in-memory
+archive, with name C<$filename> and content C<$data>. Specific options
+can be set using C<$opthashref>, which will be documented later.
+
+=item C<remove(@filenamelist)>
+
+Removes any entries with names matching any of the given filenames
+from the in-memory archive. String comparisons are done with C<eq>.
+
+=item C<read('F<file.tar>',$compressed)>
+
+Try to read the given tarfile into memory. If the second argument is a
+true value, the tarfile is assumed to be compressed. Will I<replace>
+any previous content in C<$tar>!
+
+=item C<write('F<file.tar>',$compressed)>
+
+Will write the in-memory archive to disk. If no filename is given,
+returns the entire formatted archive as a string, which should be
+useful if you'd like to stuff the archive into a socket or a pipe to
+gzip or something. If the second argument is true, the module will try
+to write the file compressed.
+
+=item C<data()>
+
+Returns the in-memory archive. This is a list of references to hashes,
+the internals of which is not currently documented.
+
+=item C<extract(@filenames)>
+
+Write files whose names are equivalent to any of the names in
+C<@filenames> to disk, creating subdirectories as neccesary. This
+might not work too well under VMS and MacOS.
+
+=back
+
+=head1 CHANGES
+
+=over 4
+
+=item Version 0.05
+
+Quoted lots of barewords to make C<use strict;> stop complaining under
+perl version 5.003.
+
+Ties to L<Compress::Zlib> put in. Will warn if it isn't available.
+
+$tar->write() with no argument now returns the formatted archive.
+
+=item Version 0.04
+
+Made changes to write_tar so that Solaris tar likes the resulting
+archives better.
+
+Protected the calls to readlink() and symlink(). AFAIK this module
+should now run just fine on Windows NT.
+
+Add method to write a single entry to disk (extract)
+
+Added method to add entries entirely from scratch (add_data)
+
+Changed name of add() to add_file()
+
+All calls to croak() removed and replaced with returning undef and
+setting Tar::error.
+
+Better handling of tarfiles with garbage at the end.
+
+=cut
